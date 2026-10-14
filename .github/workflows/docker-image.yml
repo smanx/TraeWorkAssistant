@@ -1,0 +1,20 @@
+# 网页手动触发入口（占位文件，仅存在于 main/默认分支）
+# 作用：GitHub 只在默认分支上展示 "Run workflow" 按钮和分支选择器；
+#       实际运行时会执行所选分支上同路径的工作流文件。
+# 用法：Actions → CI & Docker Image → Run workflow → 分支选 docker_main
+#       → 执行 docker_main 分支的完整构建（手动触发 = linux/arm64，tag 带 -arm 后缀）
+# 注意：本文件无 push 触发器，不影响 main（桌面版）的正常 CI；误选 main 运行只会打印提示。
+name: CI & Docker Image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  entrypoint:
+    name: 请在分支选择器中选择 docker_main
+    runs-on: ubuntu-latest
+    steps:
+      - name: 提示
+        run: |
+          echo "本分支（main）是桌面版，没有 Docker 构建。"
+          echo "请重新运行本工作流，并在分支选择器中选择 docker_main 分支以构建 ARM64 Docker 镜像。"
