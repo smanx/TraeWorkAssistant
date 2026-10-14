@@ -3,7 +3,9 @@
 # - push main（默认分支）→ 额外 :latest
 # - push tag v*      → :x.y.z + :latest + :sha（semver 与版本步骤产出同值，自动去重）
 # - pull_request     → 仅跑测试与构建验证，不推镜像
-# 仅 linux/amd64（arm64 需 QEMU 交叉编译 Rust，构建极慢，暂不启用）
+# - 手动触发（workflow_dispatch）→ 打包 linux/arm64，tag 全部带 -arm 后缀（x.y.z-arm / latest-arm / sha-xxx-arm）
+#   网页入口：Actions → 本工作流 → Run workflow → 选分支（选 docker_main 即构建 docker 分支的 ARM 镜像）
+# push/tag 仍为 linux/amd64；arm64 走 QEMU 编译 Rust 极慢（1h+），故仅限手动按需触发
 name: CI & Docker Image
 
 on:
@@ -11,6 +13,7 @@ on:
     branches: [main, docker_main]
     tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -59,6 +62,12 @@ jobs:
         id: ver
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
+      # arm64 需 QEMU 模拟（x86_64 runner 上构建 arm64 镜像）；amd64 构建不受影响
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
@@ -80,13 +89,26 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,format=short
 
+      # 手动触发专用标签：全部带 -arm 后缀，避免覆盖 push 产出的 amd64 镜像 tag
+      - name: 计算 ARM 镜像标签
+        id: meta-arm
+        if: github.event_name == 'workflow_dispatch'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}-arm
+            type=raw,value=latest-arm,enable={{is_default_branch}}
+            type=sha,format=short,suffix=-arm
+
       - name: 构建并推送
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
+          # push/tag → amd64；手动触发 → arm64（QEMU 模拟）
+          platforms: ${{ github.event_name == 'workflow_dispatch' && 'linux/arm64' || 'linux/amd64' }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ github.event_name == 'workflow_dispatch' && steps.meta-arm.outputs.tags || steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
