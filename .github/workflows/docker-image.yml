@@ -1,17 +1,11 @@
-# CI + Docker 镜像发布一体工作流（原 ci.yml 已并入：Rust 测试 + 前端构建作为发布前置门禁）
-# - 任意分支 push → :x.y.z（取 package.json 版本）+ 分支名 + :sha
-# - push main（默认分支）→ 额外 :latest
-# - push tag v*      → :x.y.z + :latest + :sha（semver 与版本步骤产出同值，自动去重）
-# - pull_request     → 仅跑测试与构建验证，不推镜像
-# - 手动触发（workflow_dispatch）→ 打包 linux/amd64 + linux/arm64 双架构，tag 与 push 相同（x.y.z / 分支名 / sha）
+# Docker 镜像发布工作流（仅手动触发，push 不再触发构建）
+# - 手动触发（workflow_dispatch）→ 打包 linux/amd64 + linux/arm64 双架构
+#   tag：:x.y.z（取 package.json 版本）+ 分支名 + :sha
 #   网页入口：Actions → 本工作流 → Run workflow → 选分支（选 docker_main 即构建 docker 分支的双架构镜像）
-# push 仍仅 linux/amd64；arm64 走 QEMU 编译 Rust 极慢（1h+），双架构仅限手动按需触发
+# arm64 走 QEMU 编译 Rust 极慢（1h+），故仅手动按需触发
 name: CI & Docker Image
 
 on:
-  push:
-    branches: [main, docker_main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
