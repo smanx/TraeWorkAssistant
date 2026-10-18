@@ -1,11 +1,11 @@
 # 网页手动触发入口（占位文件，仅存在于 main/默认分支）
 # 作用：GitHub 只在默认分支上展示 "Run workflow" 按钮和分支选择器；
 #       实际运行时会执行所选分支上同路径的工作流文件。本文件与 docker_main 分支的
-#       ARM64 打包脚本同名（.github/workflows/docker-arm.yml），同名才能切到 docker_main 运行。
-# 用法：Actions → Docker Image (ARM64) → Run workflow → 分支选 docker_main
-#       → 构建 linux/arm64 Docker 镜像（tag 带 -arm64 后缀）。
+#       多架构打包脚本同名（.github/workflows/docker-build.yml），同名才能切到 docker_main 运行。
+# 用法：Actions → Docker Build (amd64 + arm64) → Run workflow → 分支选 docker_main
+#       → 构建 linux/amd64 + linux/arm64 多架构 Docker 镜像。
 # 注意：本文件无 push 触发器，不影响 main（桌面版）的正常 CI；误选 main 运行只会打印提示。
-name: Docker Image (ARM64)
+name: Docker Build (amd64 + arm64)
 
 on:
   workflow_dispatch:
@@ -18,4 +18,4 @@ jobs:
       - name: 提示
         run: |
           echo "本分支（main）是桌面版，没有 Docker 构建。"
-          echo "请重新运行本工作流，并在分支选择器中选择 docker_main 分支以构建 ARM64 Docker 镜像。"
+          echo "请重新运行本工作流，并在分支选择器中选择 docker_main 分支以构建多架构 Docker 镜像（amd64 + arm64）。"
