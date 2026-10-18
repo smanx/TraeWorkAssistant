@@ -280,6 +280,11 @@ fn stream_convert_src(
                     ));
                 }
                 "done" | "turn_completion" => {
+                    // 审查 Low 修复：上游偶发双完成事件（done + turn_completion），
+                    // 首个完成帧已发则忽略后续，防同一 SSE 流拼接第二份收尾帧
+                    if saw_done {
+                        continue;
+                    }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
                         // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）
@@ -417,6 +422,11 @@ fn stream_convert_text_src(
                     ));
                 }
                 "done" | "turn_completion" => {
+                    // 审查 Low 修复：上游偶发双完成事件（done + turn_completion），
+                    // 首个完成帧已发则忽略后续，防同一 SSE 流拼接第二份收尾帧
+                    if saw_done {
+                        continue;
+                    }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
                         // 调用方换号重试（issue #57）
@@ -622,15 +632,20 @@ fn anthropic_stop_reason(finish: &str) -> &'static str {
 
 /// token 数值宽口径解析：整数直收；f64 四舍五入（上游偶发 123.0 形态）；字符串
 /// 形态（"123"）解析。审查修复：原 as_i64 窄口径下这两种形态静默归零，可出现
-/// 「缓存读 > 总输入」的矛盾账
+/// 「缓存读 > 总输入」的矛盾账；负值拒收（M3，对齐 wb_sse 防御）——原三条
+/// 路径均接受负数，异常上游回传负 usage 同样产生矛盾账
 fn token_number(v: &Value) -> Option<i64> {
-    if let Some(n) = v.as_i64() {
-        return Some(n);
-    }
-    if let Some(f) = v.as_f64() {
-        return f.is_finite().then(|| f.round() as i64);
-    }
-    v.as_str()?.trim().parse::<i64>().ok()
+    let n = if let Some(n) = v.as_i64() {
+        n
+    } else if let Some(f) = v.as_f64() {
+        if !f.is_finite() {
+            return None;
+        }
+        f.round() as i64
+    } else {
+        v.as_str()?.trim().parse::<i64>().ok()?
+    };
+    (n >= 0).then_some(n)
 }
 
 fn usage_i64(u: &Value, keys: &[&str]) -> Option<i64> {
@@ -646,7 +661,7 @@ pub(crate) fn normalize_openai_usage(u: &Value) -> Value {
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "total_tokens": prompt + completion,
+        "total_tokens": prompt.saturating_add(completion),
         "prompt_tokens_details": { "cached_tokens": cached_tokens_of(u) },
     })
 }
@@ -925,6 +940,12 @@ fn stream_convert_anthropic_src(
                     usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    // 上游偶发双完成（sibling 两转换器同款守卫）：二次完成会重发全部
+                    // tool_use 块 + message_delta/message_stop，对 Claude Code 等严格
+                    // 客户端属协议违规——首帧后静默忽略后续完成事件
+                    if saw_done {
+                        continue;
+                    }
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;
                     }

@@ -577,6 +577,19 @@ fn apply_native_risk_headers(h: &mut Vec<(String, String)>, n: &NativeRiskIdenti
     }
 }
 
+/// 头值 ASCII 净化（issue #116）：头值仅接受 ASCII 可见字符，计算机名含中文等
+/// 非 ASCII 时 `Cosy-MachineHostname` 会在发包前被 ureq 拒绝（Bad Header →
+/// status=0 网络不可达，请求根本没发出去）。保留 0x21..=0x7E 可见 ASCII，
+/// 过滤非 ASCII/控制字符/空白；净化后为空回退 "PC"（与 env 缺省一致）。
+fn sanitize_header_ascii(s: &str) -> String {
+    let cleaned: String = s.chars().filter(char::is_ascii_graphic).collect();
+    if cleaned.is_empty() {
+        "PC".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// 按客户端 openapi 域实测形态补齐设备描述头（proxy 抓包 2026-10-07 12:35，客户端
 /// 0.4.3 对全部 openapi 请求携带：cosy-version / cosy-machineos / cosy-machinehostname
 /// / cosy-machinecode / cosy-machinetype + 原生 cosy-machinetoken）。
@@ -594,7 +607,9 @@ fn extend_device_headers_with(
     let has = |h: &[(String, String)], k: &str| {
         h.iter().any(|(a, _)| a.eq_ignore_ascii_case(k))
     };
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string());
+    // issue #116：计算机名真值经 ASCII 净化后再入头
+    let hostname =
+        sanitize_header_ascii(&std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string()));
     for (k, v) in [
         ("Cosy-Version", CLIENT_COSY_VERSION.to_string()),
         ("Cosy-MachineOS", CLIENT_MACHINE_OS.to_string()),
@@ -1019,7 +1034,9 @@ fn is_pat_channel(creds: &QoderCreds) -> bool {
 
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
 /// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/expired_needs_relogin/
-/// refreshed/refreshed_unsaved/refresh_failed/auth_dead/pat_rejected。
+/// refreshed/refreshed_unsaved/refresh_failed/auth_dead/pat_rejected/refresh_busy。
+/// refresh_busy（H3 审查修复）：账号级跨进程刷新锁被他进程持有时，沿用当前
+/// 凭证返回——暂态语义，调用方不得据此永久禁用账号。
 ///
 /// PAT 通道（R-6）：pt- 不被 sash 业务端点接受（实测 401），先经 jobToken 换取
 /// 24h 作业令牌；作业令牌临期（< lazy_hours，与客户端通道同语义）或已过期时用
@@ -1046,11 +1063,6 @@ pub fn ensure_fresh(
     // 作业令牌 refresh_token 的兼容性（旧门控 e<=now 使临期窗口误入该通道报 refresh_failed）。
     if is_pat_channel(&creds) {
         // ── PAT 通道：确保作业令牌有效 ──
-        let pat = if creds.pat.is_empty() {
-            creds.access_token.clone()
-        } else {
-            creds.pat.clone()
-        };
         // 临期窗口消费 lazy_hours（与客户端通道同语义，不再写死 1h）：调用方传
         // i64::MAX（401 自愈/恒刷路径）时 saturating_mul 封顶 → 无条件重换——原硬编码
         // 1h 窗口会把「服务端已吊销但本地未临期」的令牌挡回 fresh，401 自愈失效
@@ -1061,6 +1073,28 @@ pub fn ensure_fresh(
         if !need_exchange {
             return (creds, false, "fresh");
         }
+        // H3 修复（审查）：PAT 重换前持账号级跨进程刷新锁（对齐 wb_common
+        // cross_refresh_lock）——schtasks CLI 与应用内调度/网关双进程并发刷新
+        // 同账号时双发重换互踩。抢锁失败 = 他进程正在刷新：沿用当前凭证返回
+        // refresh_busy（暂态 note，绝不触发永久禁用；401 自愈轮次会在锁释放后
+        // 重入成功）
+        let Some(_cross_guard) = cross_refresh_guard(state, acct_id) else {
+            return (creds, false, "refresh_busy");
+        };
+        // 持锁后二次检查（对齐 H-1 进程内锁语义）：等锁期间他进程可能已换好落库
+        let creds = effective_creds(state, acct_id);
+        let need = creds.access_token.starts_with("pt-")
+            || creds
+                .expires_at_ms
+                .is_none_or(|e| e - now_ms < lazy_hours.saturating_mul(3_600_000));
+        if !need {
+            return (creds, false, "fresh");
+        }
+        let pat = if creds.pat.is_empty() {
+            creds.access_token.clone()
+        } else {
+            creds.pat.clone()
+        };
         return match exchange_job_token(agent, &pat, &state.data_dir) {
             Ok(new) => {
                 // 落库失败不能静默：否则新作业令牌只存活本轮，下轮仍走 PAT 重换
@@ -1105,6 +1139,21 @@ pub fn ensure_fresh(
             return (creds, false, "fresh");
         }
     }
+    // H3 修复（审查）：客户端通道一次性轮换 refresh_token——双进程（schtasks CLI
+    // × 应用内调度/网关）并发刷新同账号时以同一 RT 双发，服务端轮换下后到者
+    // 4xx → 误判 AuthDead 永久禁用账号。刷新前持账号级跨进程锁；抢锁失败
+    // 沿用当前凭证返回 refresh_busy（暂态，401 自愈轮次稍后重入）
+    let Some(_cross_guard) = cross_refresh_guard(state, acct_id) else {
+        return (creds, false, "refresh_busy");
+    };
+    // 持锁后二次检查：等锁期间他进程可能已刷新落库，直接复用新令牌
+    let creds = effective_creds(state, acct_id);
+    if let Some(exp) = creds.expires_at_ms {
+        let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
+        if remain_h > lazy_hours as f64 {
+            return (creds, false, "fresh");
+        }
+    }
     // P1（对照 wb 分类语义）：区分暂态与永久失败——HTTP 4xx 意味着 refresh_token 已被
     // 服务端永久拒绝（吊销/过期），与网络故障同报 refresh_failed 会被调度器当暂态
     // 无限重试；永久失败回写池 needs_relogin（对照 wb_common::mark_needs_relogin 落库）
@@ -1138,6 +1187,23 @@ pub fn ensure_fresh(
         return (creds, false, "auth_dead");
     }
     (creds, false, "refresh_failed")
+}
+
+/// H3 修复（审查）：ensure_fresh 两通道刷新前的账号级跨进程刷新锁
+/// （ns="qrefresh"，与 checkin/credits/refresh 轮次锁互不串扰；背景见上方
+/// CrossProcLock 注释块）。抢锁失败落日志并返回 None——对齐 wb_common
+/// cross_refresh_lock 口径「本轮沿用现有凭证」，调用方报 refresh_busy
+fn cross_refresh_guard(state: &AppState, acct_id: &str) -> Option<CrossProcLock> {
+    let (guard, fail) =
+        CrossProcLock::try_acquire_ns(&state.data_dir, "qrefresh", acct_id, 5_000);
+    if guard.is_none() {
+        let reason = fail.as_ref().map(|f| f.describe()).unwrap_or_default();
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] 跨进程刷新锁未获取(id={acct_id}, {reason})，本轮沿用当前凭证（refresh_busy）"),
+        );
+    }
+    guard
 }
 
 // ── 网关 identity 失败分类（审查 P2：瞬时失败不再永久禁用账号）──────────────
@@ -1500,6 +1566,18 @@ mod tests {
         let mut h2 = vec![("Cosy-MachineCode".to_string(), "keep".to_string())];
         extend_device_headers_with(&mut h2, &c, None);
         assert!(h2.iter().any(|(k, v)| k == "Cosy-MachineCode" && v == "keep"));
+    }
+
+    /// issue #116：计算机名含中文等非 ASCII 时头值必须净化为可见 ASCII
+    ///（否则 ureq 发包前报 Bad Header，请求未发出 → status=0 网络不可达）
+    #[test]
+    fn sanitize_header_ascii_filters_non_ascii_and_falls_back() {
+        assert_eq!(sanitize_header_ascii("DESKTOP-ABC123"), "DESKTOP-ABC123");
+        assert_eq!(sanitize_header_ascii("我的PC-01"), "PC-01");
+        assert_eq!(sanitize_header_ascii("中文机器名"), "PC", "全非 ASCII 回退默认值");
+        assert_eq!(sanitize_header_ascii(""), "PC");
+        // 控制字符与空白同属头值校验拒绝面，一并过滤
+        assert_eq!(sanitize_header_ascii("ab\tc d"), "abcd");
     }
 
     /// runtime-info.exe stdout 解析：容忍 '.' 终止符（客户端桥分段语义）、拒绝空值

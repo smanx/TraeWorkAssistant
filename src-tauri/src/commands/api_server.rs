@@ -187,19 +187,24 @@ pub async fn do_start(
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
-    // 冷却/禁用标记落 app.log（F-80）：三池注入 (data_dir, 池标签)，
+    let buddy_ai_pool = ApiPool::new();
+    // 冷却/禁用标记落 app.log（F-80）：四池注入 (data_dir, 池标签)，
     // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
     pool.set_log_ctx(&state.data_dir, "trae");
     wb_pool.set_log_ctx(&state.data_dir, "buddy");
     qoder_pool.set_log_ctx(&state.data_dir, "qoder");
-    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
-    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
+    buddy_ai_pool.set_log_ctx(&state.data_dir, "buddy-ai");
+    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时四池应用
+    //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置。
+    // M3 审查修复：buddy-ai 池补齐——原先冷启动漏设，调度策略保存前启动的服务
+    // 国际档不过滤低余额账号，与 dispatch_policy_set 热应用「四池即时生效」不一致）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
     pool.set_reserve_credits(reserve_credits);
     wb_pool.set_reserve_credits(reserve_credits);
     qoder_pool.set_reserve_credits(reserve_credits);
+    buddy_ai_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
-        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
+        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool, &buddy_ai_pool);
 
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -239,6 +244,25 @@ pub async fn do_start(
             pool_file.qoder_enabled,
             qoder_count,
             qoder_strategy.as_str(),
+        ),
+    );
+
+    // buddy-ai 国际池启动概况（池内策略：buddy_ai_strategy 空 = 跟随 Trae 池，
+    // 与 Buddy/Qoder 池同语义；开关默认 false，未启用时不产生告警噪音）
+    let buddy_ai_strategy = crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
+        &pool_file.strategy,
+        &pool_file.buddy_ai_strategy,
+    );
+    buddy_ai_pool.set_strategy(buddy_ai_strategy);
+    // G7 审查修复：补 accounts 计数——WB/Qoder 池启动日志均带账号数，buddy-ai 池
+    // 原先只记开关与策略，导入/同步是否落号无法从启动日志确认（排查盲区）
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-BuddyAI国际池: enabled={} accounts={} strategy={}",
+            pool_file.buddy_ai_enabled,
+            buddy_ai_pool.count(),
+            buddy_ai_strategy.as_str(),
         ),
     );
 
@@ -304,12 +328,29 @@ pub async fn do_start(
         qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
             pool_file.qoder_pool_sticky_ttl_secs,
         ),
+        buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
+            pool_file.buddy_ai_pool_sticky_ttl_secs,
+        ),
+        buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(
+            pool_file.buddy_ai_sticky_enabled,
+        ),
+        buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(
+            pool_file.buddy_ai_hedge_threshold_ms,
+        ),
+        // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，api_pool.json，serde default 兼容旧文件）
+        qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(pool_file.qoder_flash_free_rate),
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         // Trae 池会话粘性存储（per-pool 批次新增）："t:" 命名空间与 wb/qoder 互不串绑
         trae_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "t:"),
+        // buddy-ai 显式会话粘性存储（§4.2）："g:" 命名空间与 wb（无前缀）/q:"/t:" 互不串绑
+        buddy_ai_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "g:"),
+        // buddy-ai 独立池（§3.4 隔离清单）：开关默认关（dispatch 显式开启制）
+        buddy_ai_pool,
+        buddy_ai_enabled: std::sync::atomic::AtomicBool::new(pool_file.buddy_ai_enabled),
         listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -322,6 +363,8 @@ pub async fn do_start(
         usage_dirty: Mutex::new(Vec::new()),
         wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
         wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
         // Trae 401 自愈回调（issue #27 方案 B）：网关层无 AppState，闭包借 AppHandle
         // 每次取 State 调 refresh_jwt_impl(force=true)（全防护：锁/冷却/轮换/失效标记）
         trae_jwt_refresh: Some({
@@ -356,8 +399,11 @@ pub async fn do_start(
                     // 网关侧走 Server 熔断可自愈；仅永久失效（凭证缺失/过期需重登/
                     // PAT 被拒/refresh_token 被拒）走 SessionDead 永久禁用
                     return Err(match status {
-                        "refresh_failed" => format!(
-                            "{}qoder 凭证暂不可用(id={acct_id}, status={status}；网络/服务端暂态，稍后自动恢复)",
+                        // refresh_busy（H3）：跨进程刷新锁被他进程持有——暂态，
+                        // 必须与 refresh_failed 同走熔断可自愈，否则会被误标
+                        // SessionDead 永久禁用（误标恰是 H3 要消除的后果）
+                        "refresh_failed" | "refresh_busy" => format!(
+                            "{}qoder 凭证暂不可用(id={acct_id}, status={status}；网络/服务端暂态或他进程正在刷新，稍后自动恢复)",
                             crate::tasks::qoder_common::TRANSIENT_ERR_TAG
                         ),
                         _ => format!("qoder 凭证缺失(id={acct_id}, status={status})"),
@@ -386,6 +432,12 @@ pub async fn do_start(
     shared
         .qoder_pool
         .set_concurrency_limit(pool_file.qoder_account_concurrency_limit);
+    shared
+        .buddy_ai_pool
+        .set_concurrency_limit(pool_file.buddy_ai_account_concurrency_limit);
+    shared
+        .buddy_ai_sticky
+        .set_explicit_ttl(pool_file.buddy_ai_sticky_ttl_secs as i64);
     shared
         .trae_sticky
         .set_explicit_ttl(pool_file.trae_sticky_ttl_secs as i64);
@@ -430,9 +482,9 @@ pub async fn do_start(
     // 积分快照时后台刷新一次——reserve 过滤对陈旧快照 fail-open，刷新拨新后
     // 自动恢复生效。三池口径：
     //   Trae 池：refresh_remaining_credits_impl 逐账号刷新，经 push_credits 回写拨新；
-    //   WB 池：wb_credits_snapshot_task 快照后按 ok=true 账号经 update_credits 拨新
-    //     （只更新余额+时间戳，不触碰运行期健康状态；此前 WB 池无运行期拨新
-    //     路径，陈旧快照会一直 fail-open）；
+    //   WB 池：wb_credits_snapshot_task 快照后经 write_back_pool_balances 内部
+    //     runtime 句柄 update_credits_snapshot 三键拨新（issue #109 同类：
+    //     credits/expire/fetched_at，ok=true 账号，失败账号保留旧值）；
     //   Qoder 池（issue #102）：run_snapshot_task 快照后按 ok 行经
     //     update_credits_snapshot 三键拨新（credits/expire_at/fetched_at）——
     //     selectable 零积分与到期过滤均无新鲜度自愈，装配时 Some(0.0)/已过期的
@@ -470,33 +522,28 @@ pub async fn do_start(
                 }
             }
             if wb_stale {
-                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2) {
+                // 拨新在 wb_credits_snapshot_task 内部经 runtime 完成（ok 行三键拨新，
+                // 对齐下方 Qoder 池口径）
+                match crate::commands::workbuddy::wb_credits_snapshot_task(&st2, Some(rt_state.inner()))
+                {
                     Ok(parsed) => {
-                        // 仅 ok=true 账号拨新，失败账号保留旧值防误清
-                        //（对齐 write_back_pool_balances 的到期回写口径）
-                        let mut m: std::collections::HashMap<String, f64> =
-                            std::collections::HashMap::new();
-                        if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
-                            for acc in accounts {
-                                let ok = acc
-                                    .get("ok")
-                                    .and_then(serde_json::Value::as_bool)
-                                    .unwrap_or(true);
-                                if !ok {
-                                    continue;
-                                }
-                                if let (Some(uid), Some(bal)) = (
-                                    acc.get("user_id").and_then(|v| v.as_str()),
-                                    acc.get("balance").and_then(|v| v.as_f64()),
-                                ) {
-                                    m.insert(uid.to_string(), bal);
-                                }
-                            }
-                        }
-                        shared.wb_pool.update_credits(&m);
+                        // 计 ok=true 且 balance 可解析（实际拨新）账号，对齐
+                        // write_back_pool_balances 的 snapshot 收集口径（Trae(ok_count)/Qoder(ok 行)）
+                        let n = parsed
+                            .get("accounts")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter(|x| {
+                                        x.get("ok").and_then(|v| v.as_bool()).unwrap_or(true)
+                                            && x.get("balance").and_then(|v| v.as_f64()).is_some()
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0);
                         fs_utils::app_log(
                             &st2.data_dir,
-                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", m.len()),
+                            &format!("API服务启动-积分保鲜: WB池拨新完成 accounts={}", n),
                         );
                     }
                     Err(e) => fs_utils::app_log(
@@ -730,6 +777,7 @@ fn apply_pool_snapshot(
     pool: &ApiPool,
     wb_pool: &ApiPool,
     qoder_pool: &ApiPool,
+    buddy_ai_pool: &ApiPool,
 ) -> (usize, usize, usize, usize) {
     let accounts = crate::vault::load_accounts(state);
     let pool_file = load_pool_file(&state.data_dir);
@@ -857,6 +905,43 @@ fn apply_pool_snapshot(
     let qoder_ids: Vec<String> = qoder_sync.iter().map(|a| a.uid.clone()).collect();
     let qoder_uids = effective_qoder_uids(&pool_file, &qoder_ids);
     qoder_pool.sync_from_qoder(&qoder_sync, &qoder_uids);
+    // buddy-ai 独立池装配：buddy_ai_accounts 表独立取号独立入池，与 wb 池零混居
+    //（§3.1 硬约束 1）；fail-open 全量含凭证账号入池（禁用由 needs_relogin 表达，
+    // 对齐 Qoder 池语义）。分组筛选先行（buddy_ai_group_ids 非空时仅纳入所选分组，
+    // 未分组账号不参与，对齐 WB/Qoder 池 T10 语义）+ 标签筛选取交集（D5 池语义）。
+    // 开关 buddy_ai_enabled 在网关路由层消费（默认关，dispatch 显式开启制）
+    let buddy_ai_accounts_raw = crate::commands::workbuddy::buddy_ai_upstream_accounts(state);
+    let buddy_ai_group_filter: Option<std::collections::HashSet<&str>> =
+        if pool_file.buddy_ai_group_ids.is_empty() {
+            None
+        } else {
+            Some(
+                pool_file
+                    .buddy_ai_group_ids
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect(),
+            )
+        };
+    let buddy_ai_tag_filter =
+        crate::api_server::org_index::tag_uid_set(&pool_file.buddy_ai_tag_ids, &tag_map);
+    let buddy_ai_accounts: Vec<_> = match (&buddy_ai_group_filter, &buddy_ai_tag_filter) {
+        (Some(f), Some(t)) => buddy_ai_accounts_raw
+            .into_iter()
+            .filter(|a| f.contains(a.group_id.as_str()) && t.contains(&a.uid))
+            .collect(),
+        (Some(f), None) => buddy_ai_accounts_raw
+            .into_iter()
+            .filter(|a| f.contains(a.group_id.as_str()))
+            .collect(),
+        (None, Some(t)) => buddy_ai_accounts_raw
+            .into_iter()
+            .filter(|a| t.contains(&a.uid))
+            .collect(),
+        (None, None) => buddy_ai_accounts_raw,
+    };
+    let buddy_ai_uids: Vec<String> = buddy_ai_accounts.iter().map(|a| a.uid.clone()).collect();
+    buddy_ai_pool.sync_from_wb(&buddy_ai_accounts, &buddy_ai_uids);
     (pool.count(), wb_uids.len(), wb_accounts.len(), qoder_pool.count())
 }
 
@@ -871,8 +956,13 @@ pub fn reload_pools_if_running(
 ) {
     let guard = safe_lock(runtime);
     let Some(rt) = guard.as_ref() else { return };
-    let (trae, wb_uids, wb_total, qoder) =
-        apply_pool_snapshot(state, &rt.shared.pool, &rt.shared.wb_pool, &rt.shared.qoder_pool);
+    let (trae, wb_uids, wb_total, qoder) = apply_pool_snapshot(
+        state,
+        &rt.shared.pool,
+        &rt.shared.wb_pool,
+        &rt.shared.qoder_pool,
+        &rt.shared.buddy_ai_pool,
+    );
     fs_utils::app_log(
         &state.data_dir,
         &format!(
@@ -884,7 +974,7 @@ pub fn reload_pools_if_running(
 /// 网关运行中回写 Trae 池积分快照（issue #67）：refresh_remaining_credits 刷新后
 /// 调用，让 expire_first 等策略基于最新积分选号。此前刷新只写库不回写池，秃号
 /// 内存中 credits>0 永远 selectable、粘性/策略持续命中同一账号。服务未运行时
-/// no-op；仅回写 Trae 池（WB 池积分随 sync_from_wb 走另一数据链，不适用）。
+/// no-op；仅回写 Trae 池（WB 池经 write_back_pool_balances 独立链路运行期拨新）。
 pub fn push_credits_if_running(
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
@@ -893,16 +983,30 @@ pub fn push_credits_if_running(
     let Some(rt) = guard.as_ref() else { return };
     let credits_file: RemainingCreditsFile =
         crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
-    // 池积分语义与 apply_pool_snapshot 一致：优先 general 表，回退旧总积分表
-    let pool_credits: std::collections::HashMap<String, f64> = credits_file
+    // 三键拨新（issue #109）：此前只拨余额两键，credits_expire_at 钉死在装配时刻——
+    // 网关启动后新登录/新刷新的账号池内 expire=None，被 expire_first
+    // 「有过期时间者优先」恒压（调度持续命中带旧到期信息的老账号，新会话同样命中）；
+    // 充值续期后的新到期也进不了池，旧值已过期的账号甚至被 selectable 整体排除。
+    // 积分与到期均对齐 apply_pool_snapshot 装配口径：优先 general 表，到期用
+    // merge_pool_expire_times（general 优先、混合口径兜底），池状态与重启后一致
+    let expire_times = merge_pool_expire_times(&credits_file);
+    let pool_snapshot: std::collections::HashMap<String, (f64, Option<i64>)> = credits_file
         .credits
         .iter()
-        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
+        .map(|(uid, c)| {
+            (
+                uid.clone(),
+                (
+                    credits_file.general.get(uid).copied().unwrap_or(*c),
+                    expire_times.get(uid).copied(),
+                ),
+            )
+        })
         .collect();
-    rt.shared.pool.update_credits(&pool_credits);
+    rt.shared.pool.update_credits_snapshot(&pool_snapshot);
     fs_utils::app_log(
         &state.data_dir,
-        &format!("API服务池积分回写(运行期): n={}", pool_credits.len()),
+        &format!("API服务池积分回写(运行期): n={}", pool_snapshot.len()),
     );
 }
 
@@ -940,6 +1044,8 @@ fn merge_pool_set(
     qoder_enabled: Option<bool>,
     qoder_hedge_threshold_ms: Option<u64>,
     qoder_sticky_enabled: Option<bool>,
+    // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111）；None = 保留原值
+    qoder_flash_free_rate: Option<bool>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
     qoder_uids: Option<Vec<String>>,
@@ -948,6 +1054,9 @@ fn merge_pool_set(
     // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
     qoder_strategy: Option<String>,
     trae_enabled: Option<bool>,
+    // buddy-ai（国际版）显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值
+    buddy_ai_sticky_enabled: Option<bool>,
+    buddy_ai_pool_sticky_ttl_secs: Option<u64>,
 ) -> ApiPoolFile {
     // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
     // 旧版混存于共享 enabled_uids（历史兼容形态），保存时迁移归位防丢失
@@ -1004,6 +1113,7 @@ fn merge_pool_set(
         qoder_hedge_threshold_ms: qoder_hedge_threshold_ms
             .unwrap_or(existing.qoder_hedge_threshold_ms),
         qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
+        qoder_flash_free_rate: qoder_flash_free_rate.unwrap_or(existing.qoder_flash_free_rate),
         qoder_enabled_uids: qoder_uids.unwrap_or_else(|| existing.qoder_enabled_uids.clone()),
         qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
         qoder_strategy: qoder_strategy.unwrap_or_else(|| existing.qoder_strategy.clone()),
@@ -1011,6 +1121,19 @@ fn merge_pool_set(
         trae_tag_ids: existing.trae_tag_ids.clone(),
         wb_tag_ids: existing.wb_tag_ids.clone(),
         qoder_tag_ids: existing.qoder_tag_ids.clone(),
+        // buddy-ai 开关同 tag_ids 口径：pool_set 命令在 merge 后追加应用（热应用 AtomicBool）
+        buddy_ai_enabled: existing.buddy_ai_enabled,
+        buddy_ai_sticky_enabled: buddy_ai_sticky_enabled.unwrap_or(existing.buddy_ai_sticky_enabled),
+        buddy_ai_pool_sticky_ttl_secs: buddy_ai_pool_sticky_ttl_secs
+            .unwrap_or(existing.buddy_ai_pool_sticky_ttl_secs),
+        // buddy-ai per-pool 三参数 + 分组/标签筛选：pool_set 命令在 merge 后追加应用
+        buddy_ai_account_concurrency_limit: existing.buddy_ai_account_concurrency_limit,
+        buddy_ai_sticky_ttl_secs: existing.buddy_ai_sticky_ttl_secs,
+        buddy_ai_hedge_threshold_ms: existing.buddy_ai_hedge_threshold_ms,
+        buddy_ai_group_ids: existing.buddy_ai_group_ids.clone(),
+        buddy_ai_tag_ids: existing.buddy_ai_tag_ids.clone(),
+        // buddy-ai 池内调度策略：pool_set 命令在 merge 后追加应用
+        buddy_ai_strategy: existing.buddy_ai_strategy.clone(),
     }
 }
 
@@ -1056,6 +1179,8 @@ pub fn pool_set(
     qoder_hedge_threshold_ms: Option<u64>,
     // Qoder 会话粘性开关（F-80-余 v2）；None = 保留原值
     qoder_sticky_enabled: Option<bool>,
+    // Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；None = 保留原值
+    qoder_flash_free_rate: Option<bool>,
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值
     qoder_uids: Option<Vec<String>>,
     // Qoder 池分组筛选；None = 保留原值
@@ -1064,6 +1189,21 @@ pub fn pool_set(
     qoder_strategy: Option<String>,
     // Trae 池参与调度开关（默认开）；None = 保留原值
     trae_enabled: Option<bool>,
+    // buddy-ai（国际版）池上游开关（默认关，dispatch 显式开启制）；None = 保留原值
+    buddy_ai_enabled: Option<bool>,
+    // buddy-ai 显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值
+    buddy_ai_sticky_enabled: Option<bool>,
+    buddy_ai_pool_sticky_ttl_secs: Option<u64>,
+    // buddy-ai per-pool 三参数（并发上限 / 显式会话粘性 TTL / 竞速对冲阈值）；
+    // None = 保留原值（对齐 Qoder 池同型参数）
+    buddy_ai_account_concurrency_limit: Option<u32>,
+    buddy_ai_sticky_ttl_secs: Option<u64>,
+    buddy_ai_hedge_threshold_ms: Option<u64>,
+    // buddy-ai 池分组/标签筛选；None = 保留原值，Some(list) = 覆盖
+    buddy_ai_group_ids: Option<Vec<String>>,
+    buddy_ai_tag_ids: Option<Vec<String>>,
+    // buddy-ai 池内调度策略（空串 = 跟随 Trae 池）；None = 保留原值
+    buddy_ai_strategy: Option<String>,
     // 各池共享标签筛选（tag_ 前缀 id）；None = 保留原值，Some(list) = 覆盖
     // （与分组筛选取交集，D5 池语义）
     trae_tag_ids: Option<Vec<String>>,
@@ -1103,10 +1243,13 @@ pub fn pool_set(
         qoder_enabled,
         qoder_hedge_threshold_ms,
         qoder_sticky_enabled,
+        qoder_flash_free_rate,
         qoder_uids,
         qoder_group_ids,
         qoder_strategy,
         trae_enabled,
+        buddy_ai_sticky_enabled,
+        buddy_ai_pool_sticky_ttl_secs,
     );
     // 标签筛选在 merge 后追加应用（merge_pool_set 纯函数签名不动，存量单测零改动）：
     // 显式空数组 = 清空标签筛选，None = 保留
@@ -1118,6 +1261,38 @@ pub fn pool_set(
     }
     if let Some(v) = qoder_tag_ids {
         pool_file.qoder_tag_ids = v;
+    }
+    // buddy-ai 开关在 merge 后追加应用（对齐 tag_ids 先例：merge_pool_set 纯函数
+    // 签名不动，存量单测零改动）；运行中热应用到 AtomicBool
+    if let Some(v) = buddy_ai_enabled {
+        pool_file.buddy_ai_enabled = v;
+        if let Some(rt) = safe_lock(&runtime).as_ref() {
+            rt.shared
+                .buddy_ai_enabled
+                .store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // buddy-ai per-pool 三参数 + 分组/标签筛选（merge 后追加应用，对齐 buddy_ai_enabled
+    // 与 tag_ids 先例：merge_pool_set 纯函数签名不动，存量单测零改动）
+    if let Some(v) = buddy_ai_account_concurrency_limit {
+        pool_file.buddy_ai_account_concurrency_limit = v;
+    }
+    if let Some(v) = buddy_ai_sticky_ttl_secs {
+        pool_file.buddy_ai_sticky_ttl_secs = v;
+    }
+    if let Some(v) = buddy_ai_hedge_threshold_ms {
+        pool_file.buddy_ai_hedge_threshold_ms = v;
+    }
+    if let Some(v) = buddy_ai_group_ids {
+        pool_file.buddy_ai_group_ids = v;
+    }
+    if let Some(v) = buddy_ai_tag_ids {
+        pool_file.buddy_ai_tag_ids = v;
+    }
+    // buddy-ai 池内调度策略（merge 后追加应用，对齐 buddy_ai_* 先例：
+    // merge_pool_set 纯函数签名不动，存量单测零改动）
+    if let Some(v) = buddy_ai_strategy {
+        pool_file.buddy_ai_strategy = v;
     }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_cfg);
@@ -1132,6 +1307,13 @@ pub fn pool_set(
         // Qoder 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
         rt.shared.qoder_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy),
+        );
+        // buddy-ai 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
+        rt.shared.buddy_ai_pool.set_strategy(
+            crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
+                &pool_file.strategy,
+                &pool_file.buddy_ai_strategy,
+            ),
         );
         // per-pool 三参数热应用（F-76②/F-77 拆分版）：并发上限 / 池粘性 TTL /
         // 显式会话粘性 TTL 三池各自生效
@@ -1176,6 +1358,26 @@ pub fn pool_set(
             pool_file.qoder_pool_sticky_ttl_secs,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // buddy-ai 池粘性 TTL + 显式会话粘性热应用（§4.2）
+        rt.shared.buddy_ai_pool_sticky_ttl_secs.store(
+            pool_file.buddy_ai_pool_sticky_ttl_secs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.buddy_ai_sticky_enabled.store(
+            pool_file.buddy_ai_sticky_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // buddy-ai per-pool 三参数热应用（并发上限 / 显式会话粘性 TTL / 对冲阈值）
+        rt.shared
+            .buddy_ai_pool
+            .set_concurrency_limit(pool_file.buddy_ai_account_concurrency_limit);
+        rt.shared
+            .buddy_ai_sticky
+            .set_explicit_ttl(pool_file.buddy_ai_sticky_ttl_secs as i64);
+        rt.shared.buddy_ai_hedge_threshold_ms.store(
+            pool_file.buddy_ai_hedge_threshold_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Buddy 资源开关热应用（此前仅启动时读取，改动需重启服务生效）
         rt.shared
             .wb_enabled
@@ -1207,6 +1409,11 @@ pub fn pool_set(
         );
         rt.shared.qoder_sticky_enabled.store(
             pool_file.qoder_sticky_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Qwen3.8-Flash 免费活动倍率覆盖热应用（issue #111）
+        rt.shared.qoder_flash_free_rate.store(
+            pool_file.qoder_flash_free_rate,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -1248,6 +1455,18 @@ pub fn qoder_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) ->
     }
 }
 
+/// 返回运行中 Buddy 国际版（buddy-ai）池的实时状态（全局 API 管理·API Keys
+/// 调度配置候选 + 摘要卡可观测，含 per-account inflight 在途计数）；
+/// 服务未运行时返回空数组
+#[tauri::command]
+pub fn buddy_ai_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<PoolStatus> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt.shared.buddy_ai_pool.status_list(),
+        None => vec![],
+    }
+}
+
 /// 手动同步 Qoder 模型目录（Qoder「资源调度」页；复用每日调度任务入口
 /// qoder_catalog::run_task，按池序逐可用账号拉取 CN 区 model/list 并原子采纳）。
 /// 返回采纳的模型数；无账号/无凭证返回 Ok(0) 语义的信息（与调度器静默跳过一致）
@@ -1259,6 +1478,7 @@ pub async fn qoder_catalog_sync(state: State<'_, AppState>) -> Result<usize, Str
         jwt_refresh_lock: state.inner().jwt_refresh_lock.clone(),
         qoder_pool_lock: state.inner().qoder_pool_lock.clone(),
         wb_pool_lock: state.inner().wb_pool_lock.clone(),
+        buddy_ai_pool_lock: state.inner().buddy_ai_pool_lock.clone(),
         doubao_pool_lock: state.inner().doubao_pool_lock.clone(),
         group_defs_lock: state.inner().group_defs_lock.clone(),
     };
@@ -1414,6 +1634,14 @@ pub fn api_wb_catalog_list(state: State<'_, AppState>) -> Vec<crate::api_server:
     crate::api_server::wb_catalog::load(&state.data_dir)
 }
 
+/// Buddy 国际版（buddy-ai）模型目录：kv 动态目录（/v3/config 同步落盘）优先，
+/// 缺失回落内置静态表（§4.4）。此前恒回静态表（倍率占位 1.0、能力字段全空），
+/// 「同步官网模型」落盘后表格仍不更新的根因。
+#[tauri::command]
+pub fn api_buddy_ai_catalog_list(state: State<'_, AppState>) -> Vec<crate::api_server::wb_catalog::WbModel> {
+    crate::api_server::wb_catalog::buddy_ai_load(&state.data_dir)
+}
+
 /// 查询最近 N 天的 API 用量统计（Trae 模型请求桶，按日聚合，直接读盘，服务未运行也可查）
 #[tauri::command]
 pub fn api_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
@@ -1436,6 +1664,20 @@ pub fn api_custom_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> 
         &state.data_dir,
         days,
         crate::api_server::usage::UsageBucket::Custom,
+    )
+}
+
+/// 查询最近 N 天的 buddy-ai 国际池用量统计（buddy_ai_days 桶，BuddyAI「积分看板·模型消耗排行」专用）
+#[tauri::command]
+pub fn api_buddy_ai_usage_stats(
+    state: State<'_, AppState>,
+    days: Option<u32>,
+) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(30).clamp(1, 90);
+    crate::api_server::usage::query_recent_in(
+        &state.data_dir,
+        days,
+        crate::api_server::usage::UsageBucket::BuddyAi,
     )
 }
 
@@ -1565,24 +1807,46 @@ pub fn api_unified_models(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     available_only: Option<bool>,
 ) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
-    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = match safe_lock(&runtime).as_ref() {
+    let (
+        wb_enabled,
+        qoder_enabled,
+        trae_ok,
+        buddy_ok,
+        qoder_ok,
+        buddy_ai_enabled,
+        buddy_ai_ok,
+        qoder_flash_free,
+    ) = match safe_lock(&runtime).as_ref() {
         Some(rt) => {
             let s = &rt.shared;
             (
-                s.wb_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                s.qoder_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                s.wb_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                s.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed),
                 // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
                 s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
                     && s.pool.has_selectable(),
                 s.wb_pool.has_selectable(),
                 s.qoder_pool.has_selectable(),
+                s.buddy_ai_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                s.buddy_ai_pool.has_selectable(),
+                // Qwen3.8-Flash 免费活动覆盖（issue #111），与取号/排序同口径
+                s.qoder_flash_free_rate
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )
         }
         None => {
             let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
-            (pf.wb_enabled, pf.qoder_enabled, pf.trae_enabled, true, true)
+            (
+                pf.wb_enabled,
+                pf.qoder_enabled,
+                pf.trae_enabled,
+                true,
+                true,
+                pf.buddy_ai_enabled,
+                true,
+                pf.qoder_flash_free_rate,
+            )
         }
     };
     let data_dir = state.data_dir.clone();
@@ -1592,6 +1856,8 @@ pub fn api_unified_models(
         trae_ok,
         buddy_ok,
         Some((qoder_enabled, qoder_ok)),
+        Some((buddy_ai_enabled, buddy_ai_ok)),
+        qoder_flash_free,
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
@@ -1631,13 +1897,16 @@ pub fn dispatch_policy_set(
     policy: crate::api_server::dispatch::DispatchPolicy,
 ) -> Result<crate::api_server::dispatch::DispatchPolicy, String> {
     crate::api_server::dispatch::save_policy(&state.data_dir, &policy)?;
-    // 账号保留剩余积分（issue #91）热应用：保存后三池即时生效
+    // 账号保留剩余积分（issue #91）热应用：保存后四池即时生效
     //（配置锁外，与 pool_set 热应用同模式；负值由 set_reserve_credits 防御归零）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared.pool.set_reserve_credits(policy.reserve_credits);
         rt.shared.wb_pool.set_reserve_credits(policy.reserve_credits);
         rt.shared
             .qoder_pool
+            .set_reserve_credits(policy.reserve_credits);
+        rt.shared
+            .buddy_ai_pool
             .set_reserve_credits(policy.reserve_credits);
     }
     Ok(crate::api_server::dispatch::load_policy(&state.data_dir))
@@ -1912,6 +2181,7 @@ mod pool_merge_tests {
             qoder_enabled: true,
             qoder_hedge_threshold_ms: 4000,
             qoder_sticky_enabled: true,
+            qoder_flash_free_rate: true,
             qoder_account_concurrency_limit: 3,
             qoder_pool_sticky_ttl_secs: 900,
             qoder_sticky_ttl_secs: 3600,
@@ -1921,6 +2191,15 @@ mod pool_merge_tests {
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
+            buddy_ai_enabled: false,
+            buddy_ai_sticky_enabled: true,
+            buddy_ai_pool_sticky_ttl_secs: 300,
+            buddy_ai_account_concurrency_limit: 1,
+            buddy_ai_sticky_ttl_secs: 1800,
+            buddy_ai_hedge_threshold_ms: 8000,
+            buddy_ai_group_ids: Vec::new(),
+            buddy_ai_tag_ids: Vec::new(),
+            buddy_ai_strategy: "credit_first".into(),
         }
     }
 
@@ -1933,8 +2212,13 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            // buddy-ai 粘性开关 + 池粘性 TTL 未传 → 保留原值
+            None, None,
+            // Qwen3.8-Flash 免费活动覆盖未传 → 保留原值
+            None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
+        assert!(m.buddy_ai_sticky_enabled, "未传应保留原值");
         assert_eq!(m.strategy, "weighted");
         assert_eq!(m.wb_strategy, "p2c");
         assert_eq!(m.group_ids, vec!["g1".to_string()]);
@@ -1964,6 +2248,8 @@ mod pool_merge_tests {
         assert_eq!(m.qoder_hedge_threshold_ms, 4000);
         assert!(m.qoder_sticky_enabled);
         assert!(m.trae_enabled);
+        // buddy-ai 池内策略未传 → 保留原值（pool_set 在 merge 后追加应用，本函数恒保留）
+        assert_eq!(m.buddy_ai_strategy, "credit_first");
     }
 
     #[test]
@@ -1979,6 +2265,9 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None,
+            // Qwen3.8-Flash 免费活动覆盖未传 → 保留原值
+            None,
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -2086,6 +2375,11 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            // buddy-ai 粘性开关 + 池粘性 TTL 未传 → 保留原值
+            None,
+            None,
+            // Qwen3.8-Flash 免费活动覆盖未传 → 保留原值
+            None,
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -2174,6 +2468,11 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            // buddy-ai 粘性开关 + 池粘性 TTL 未传 → 保留原值
+            None,
+            None,
+            // Qwen3.8-Flash 免费活动覆盖未传 → 保留原值
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -2208,6 +2507,8 @@ mod pool_merge_tests {
             None, None, Some(vec!["g2".into()]), None, None, None, None,
             None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
+            None, None,
+            None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -2226,6 +2527,9 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None,
+            // Qwen3.8-Flash 免费活动覆盖未传 → 保留原值
+            None,
         );
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");

@@ -255,10 +255,29 @@ function defaultSettings(): Settings {
     notify_bark_url: null,
     notify_webhook_url: null,
     notify_serverchan_sendkey: null,
-    // 侧边栏应用显示：默认固定 Trae，其余应用全部显示
+    // 侧边栏应用显示：默认固定 Trae，其余应用全部显示；
+    // BuddyAI（buddy-ai 国际版）默认不展示（独立 opt-in 开关，见应用显示面板）
     pinned_app: 'trae',
     hidden_apps: [],
     app_icons: {},
+    buddy_ai_visible: false,
+    // buddy-ai 每日活跃打卡（阶段 3b）：调度开关默认关（显式开启制）、时刻 09:20、间隔 3s
+    buddy_ai_checkin_enabled: false,
+    buddy_ai_checkin_hhmm: '09:20',
+    buddy_ai_checkin_gap_secs: 3,
+    // buddy-ai 定时同步/续期（2026-10-16 六页对齐批 3）：默认开，时刻错峰
+    buddy_ai_renew_enabled: true,
+    buddy_ai_renew_hhmm: '10:35',
+    buddy_ai_credits_sync_enabled: true,
+    buddy_ai_credits_sync_hhmm: '23:45',
+    buddy_ai_credits_sync_mode: 'daily',
+    buddy_ai_credits_sync_hours: '2',
+    buddy_ai_credits_sync_days: '1',
+    buddy_ai_catalog_sync_enabled: true,
+    buddy_ai_catalog_sync_hhmm: '05:55',
+    // BuddyAI 国际客户端手动路径（环境配置页；null = 自动检测）
+    workbuddy_ai_path: null,
+    codebuddy_ai_path: null,
     // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到）；
     // 积分数据同步与 Buddy/Trae 同款四模式（默认 every_hours 每2小时，daily 时刻 23:40）
     qoder_ide_path: null,
@@ -643,10 +662,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       set((s) => ({
         qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
       }));
+      // 审查 Low：消费后端 failed_permanent（凭证终态失败，重试注定无效）——
+      // 可重试数 = failed - empty - permanent（口径对齐调度器 retryable 判定），
+      // 文案明示其中哪些需重新登录/更新 PAT，防用户对终态失败反复手点重试；
+      // 级别：含终态失败同样 warn（需要用户行动，不降级 success）
+      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - empty));
+      const retryable = failed - empty - permanent;
       get().pushToast(
-        failed - empty > 0 ? 'warn' : 'success',
+        retryable > 0 || permanent > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
-          (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : ''),
+          (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
+          (permanent > 0 ? `（其中 ${permanent} 项需重新登录/更新 PAT 后重试）` : ''),
       );
       return;
     }
@@ -745,12 +771,35 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 合法值，保证设置页下拉正确回显、pushToast 不再走兼容分支
       const validNotify = ['toast', 'system', 'both', 'none'];
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
-      // 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见
-      const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
-      if (!validApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
+      // 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见；
+      // buddy-ai（国际版）不参与固定应用（脏值回退 trae，与后端 state.rs 归一口径一致）
+      const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao', 'buddy-ai'];
+      const pinnableApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
+      if (!pinnableApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
       settings.hidden_apps = (settings.hidden_apps ?? []).filter(
         (a): a is AppKey => validApps.includes(a) && a !== settings.pinned_app,
       );
+      // BuddyAI 显示开关缺省归一为 false（默认不展示）
+      settings.buddy_ai_visible = settings.buddy_ai_visible === true;
+      // buddy-ai 打卡配置归一（开关默认关；时刻零值回填 09:20，与后端 state.rs 同口径）
+      settings.buddy_ai_checkin_enabled = settings.buddy_ai_checkin_enabled === true;
+      if (!settings.buddy_ai_checkin_hhmm?.trim()) settings.buddy_ai_checkin_hhmm = '09:20';
+      settings.buddy_ai_checkin_gap_secs =
+        typeof settings.buddy_ai_checkin_gap_secs === 'number' ? settings.buddy_ai_checkin_gap_secs : 3;
+      // buddy-ai 定时同步/续期归一（开关默认开；时刻零值回填默认，与后端 serde default 同口径）
+      settings.buddy_ai_renew_enabled = settings.buddy_ai_renew_enabled !== false;
+      if (!settings.buddy_ai_renew_hhmm?.trim()) settings.buddy_ai_renew_hhmm = '10:35';
+      settings.buddy_ai_credits_sync_enabled = settings.buddy_ai_credits_sync_enabled !== false;
+      if (!settings.buddy_ai_credits_sync_hhmm?.trim()) settings.buddy_ai_credits_sync_hhmm = '23:45';
+      // 同步模式白名单归一（审查 P3：历史/异常字符串会让 <select> 显示空选项；
+      // 与后端 scheduler credits_sync_mode 兜底同口径，空值按旧 enabled 派生）
+      {
+        const m = String(settings.buddy_ai_credits_sync_mode ?? '').trim();
+        const ok = ['off', 'hourly', 'every_hours', 'every_days', 'daily'].includes(m);
+        settings.buddy_ai_credits_sync_mode = ok ? m : settings.buddy_ai_credits_sync_enabled ? 'daily' : 'off';
+      }
+      settings.buddy_ai_catalog_sync_enabled = settings.buddy_ai_catalog_sync_enabled !== false;
+      if (!settings.buddy_ai_catalog_sync_hhmm?.trim()) settings.buddy_ai_catalog_sync_hhmm = '05:55';
       // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
       const cleanIcons: Partial<Record<AppKey, string>> = {};
       for (const [k, v] of Object.entries(settings.app_icons ?? {})) {
